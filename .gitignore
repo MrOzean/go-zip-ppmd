@@ -1,0 +1,19 @@
+# Test corpora (hundreds of MB, not committed)
+test_arch/
+
+# Binaries and build artifacts
+*.exe
+*.out
+*.obj
+*.test
+*.test.exe
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+
+# reftest build artifacts (dev/reftest)
+dev/reftest/7zip-src/
+dev/reftest/refdec
+dev/reftest/refdec.exe
