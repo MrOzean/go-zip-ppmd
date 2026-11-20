@@ -32,6 +32,8 @@ func main() {
 	case "create", "c":
 		fmt.Fprintln(os.Stderr, "zipppmd: create is not implemented yet (PPMd compression is planned)")
 		os.Exit(1)
+	case "version", "--version", "-version":
+		fmt.Println(zipppmd.Version)
 	default:
 		usage()
 		os.Exit(2)
@@ -42,7 +44,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   zipppmd list [-v] archive.zip...
   zipppmd extract [-d dir] archive.zip [patterns...]
-  zipppmd create archive.zip files... (not implemented yet)`)
+  zipppmd create archive.zip files... (not implemented yet)
+  zipppmd version`)
 }
 
 func openReader(path string) (*zipppmd.Reader, *os.File, error) {

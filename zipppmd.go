@@ -57,6 +57,8 @@ var (
 	ErrCorrupt            = errors.New("zipppmd: corrupt archive")
 	ErrChecksum           = errors.New("zipppmd: checksum error")
 	ErrInvalidPPMdProps   = errors.New("zipppmd: invalid PPMd properties")
+	ErrUnsupportedRestore = errors.New("zipppmd: PPMd restore method 2 (freeze) is not supported")
+	ErrModelMemoryLimit   = errors.New("zipppmd: PPMd model memory limit exceeded")
 	ErrInvalidState       = errors.New("zipppmd: Open called before Next")
 	errDirectorySignature = errors.New("zipppmd: expected local file header")
 )
@@ -82,6 +84,7 @@ type File struct {
 	// dataOffset is valid for files obtained from a Reader.
 	dataOffset int64
 	zip        *Reader
+	flags      uint16 // general purpose bit flags from the central directory
 }
 
 // Open returns an io.ReadCloser that decompresses the entry and verifies
@@ -90,17 +93,21 @@ func (f *File) Open() (io.ReadCloser, error) {
 	if f.zip == nil {
 		return nil, errors.New("zipppmd: Open is only valid on files from a Reader; use StreamReader.Open")
 	}
+	if f.flags&encryptedFlag != 0 {
+		return nil, fmt.Errorf("%w: %q", ErrEncrypted, f.Name)
+	}
 	body := io.NewSectionReader(f.zip.r, f.dataOffset, int64(f.CompressedSize))
-	rc, _, _, err := openBody(f.FileHeader, body)
+	rc, _, _, err := openBody(f.FileHeader, body, f.zip.maxModelMem)
 	return rc, err
 }
 
 // openBody wraps a compressed entry stream with the appropriate decoder and
-// the CRC-32 checker. It also returns the raw decompressor (for draining in
+// the CRC-32 checker. maxModelMem is the PPMd model memory limit in bytes
+// (0 means unlimited). It also returns the raw decompressor (for draining in
 // streaming mode) and the counted reader wrapping body (or nil when body is
 // not a countingReader), so the caller can position the stream exactly after
 // the entry's compressed data.
-func openBody(fh FileHeader, body io.Reader) (io.ReadCloser, io.Reader, *countingReader, error) {
+func openBody(fh FileHeader, body io.Reader, maxModelMem uint64) (io.ReadCloser, io.Reader, *countingReader, error) {
 	var counted *countingReader
 	if cr, ok := body.(*countingReader); ok {
 		counted = cr
@@ -135,12 +142,21 @@ func openBody(fh FileHeader, body io.Reader) (io.ReadCloser, io.Reader, *countin
 		}
 		val := uint32(props[0]) | uint32(props[1])<<8
 		order := int((val & 0xF) + 1)
-		memSize := uint32(((val >> 4) & 0xFF) + 1)
+		memSize := uint64(((val >> 4) & 0xFF) + 1)
 		restore := int(val >> 12)
-		if restore > ppmd.RestoreCutOff {
-			return nil, nil, counted, fmt.Errorf("%w: restore method %d (valid Ppmd8 streams only use 0=restart or 1=cutoff; 2=freeze needs unsupported build options)", ErrInvalidPPMdProps, restore)
+		if restore > 2 {
+			return nil, nil, counted, fmt.Errorf("%w: restore method %d (valid Ppmd8 props use 0..2)", ErrInvalidPPMdProps, restore)
 		}
-		d, err := ppmd.NewDecoder(body, order, memSize<<20, restore)
+		if restore == 2 {
+			return nil, nil, counted, fmt.Errorf("%w: entry %q (7-Zip default builds reject it too)", ErrUnsupportedRestore, fh.Name)
+		}
+		// Reject oversized model requests before allocating the arena: a
+		// hostile or corrupt archive can ask for up to 256 MiB per entry,
+		// and entries may be opened concurrently.
+		if maxModelMem > 0 && memSize<<20 > maxModelMem {
+			return nil, nil, counted, fmt.Errorf("%w: entry %q requests %d MiB, limit is %d MiB", ErrModelMemoryLimit, fh.Name, memSize, maxModelMem>>20)
+		}
+		d, err := ppmd.NewDecoder(body, order, uint32(memSize<<20), restore)
 		if err != nil {
 			return nil, nil, counted, fmt.Errorf("zipppmd: initializing PPMd decoder (order=%d mem=%dMB): %w", order, memSize, err)
 		}

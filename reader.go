@@ -26,15 +26,43 @@ const (
 // Reader provides random access to the entries of a ZIP archive via an
 // io.ReaderAt. The central directory is parsed by NewReader.
 type Reader struct {
-	r    io.ReaderAt
-	size int64
-	File []*File
+	r           io.ReaderAt
+	size        int64
+	maxModelMem uint64 // PPMd model memory limit per entry, in bytes (0 = unlimited)
+	File        []*File
+}
+
+// ReaderOption configures a Reader or StreamReader.
+type ReaderOption func(*readerConfig)
+
+type readerConfig struct {
+	maxModelMem uint64
+}
+
+// WithMaxModelMemory sets a limit on the PPMd model memory (in bytes) that
+// a single entry may request. The size is dictated by the entry's 2-byte
+// property block and can be as large as 256 MiB; since entries are
+// typically opened one decoder at a time but may be opened concurrently
+// (e.g. by an HTTP handler), a server should set a limit to reject archives
+// with excessive parameters before any memory is allocated. Entries over
+// the limit fail to open with ErrModelMemoryLimit. A non-positive value
+// means unlimited (the default).
+func WithMaxModelMemory(n int64) ReaderOption {
+	return func(c *readerConfig) {
+		if n > 0 {
+			c.maxModelMem = uint64(n)
+		}
+	}
 }
 
 // NewReader reads the central directory of a ZIP archive and returns a
 // Reader. size must be the full size of the archive.
-func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
-	z := &Reader{r: r, size: size}
+func NewReader(r io.ReaderAt, size int64, opts ...ReaderOption) (*Reader, error) {
+	var cfg readerConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	z := &Reader{r: r, size: size, maxModelMem: cfg.maxModelMem}
 	if err := z.init(); err != nil {
 		return nil, err
 	}
@@ -174,7 +202,8 @@ func (z *Reader) init() error {
 				CRC32:            crc,
 				Modified:         dosTimeToUnix(modTime, modDate),
 			},
-			zip: z,
+			zip:   z,
+			flags: flags,
 		}
 		if err := f.findDataOffset(int64(lhOffset)); err != nil {
 			return fmt.Errorf("zipppmd: entry %q: %w", name, err)

@@ -53,8 +53,8 @@ const (
 	glueCountInit = 1 << 13
 )
 
-// errCorrupt is returned when the compressed data is malformed.
-var errCorrupt = errors.New("ppmd: corrupt data")
+// ErrCorrupt is returned when the compressed data is malformed.
+var ErrCorrupt = errors.New("ppmd: corrupt data")
 
 // Model is the PPMd var.I model state (CPpmd8 in the C sources).
 // All pointers of the original C implementation are represented as uint32
@@ -574,7 +574,8 @@ func (b *byteReader) refill() {
 }
 
 // readByte returns the next byte; when the input is exhausted it returns 0
-// and sets the failed flag.
+// and sets the failed flag, which the decoder treats as corrupt data
+// (io.ErrUnexpectedEOF) rather than feeding the phantom zeros on.
 func (b *byteReader) readByte() byte {
 	if b.pos >= len(b.buf) {
 		b.refill()
@@ -612,7 +613,7 @@ func NewDecoder(r io.Reader, order int, memorySize uint32, restore int) (*Decode
 	d.m.Construct()
 	d.m.Alloc(memorySize)
 	if !d.initRangeDec() {
-		return nil, errCorrupt
+		return nil, ErrCorrupt
 	}
 	if err := d.m.Init(uint32(order), uint32(restore)); err != nil {
 		return nil, err
@@ -640,7 +641,7 @@ func (d *Decoder) DecodeSymbol() (int, error) {
 		if d.br.failed {
 			return 0, io.ErrUnexpectedEOF
 		}
-		return 0, errCorrupt
+		return 0, ErrCorrupt
 	}
 	return sym, nil
 }
@@ -656,7 +657,7 @@ func (d *Decoder) Read(buf []byte) (int, error) {
 			if d.br.failed {
 				return n, io.ErrUnexpectedEOF
 			}
-			return n, errCorrupt
+			return n, ErrCorrupt
 		}
 		if sym == -1 {
 			if n > 0 {

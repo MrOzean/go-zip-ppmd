@@ -5,10 +5,12 @@ import (
 	"compress/flate"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -105,62 +107,98 @@ func TestStreamReaderPPMd(t *testing.T) {
 	}
 }
 
+// testEntry is one entry of an in-memory test archive.
+type testEntry struct {
+	name   string
+	method uint16
+	flags  uint16
+	body   []byte
+	crc    uint32
+}
+
 // buildZip builds a minimal single-entry ZIP archive in memory using the
 // given method. body is the stored (method 0) or raw-deflated (method 8)
 // payload; crc is the checksum of the uncompressed data.
 func buildZip(name string, method uint16, body []byte, crc uint32) []byte {
+	return buildZipEntries(testEntry{name: name, method: method, body: body, crc: crc})
+}
+
+// ppmdProps packs a 2-byte PPMd property block (order, memory in MiB,
+// restore method), as stored at the start of a method-98 entry body.
+func ppmdProps(memMB, order, restore int) []byte {
+	val := uint16(memMB-1)<<4 | uint16(order-1) | uint16(restore)<<12
+	return []byte{byte(val), byte(val >> 8)}
+}
+
+// buildPPMdZip builds a single-entry method-98 archive whose body starts
+// with the given PPMd property bytes.
+func buildPPMdZip(props []byte, tail []byte, crc uint32) []byte {
+	body := append(append([]byte{}, props...), tail...)
+	return buildZip("x.bin", MethodPPMd, body, crc)
+}
+
+// buildZipEntries builds a minimal multi-entry ZIP archive in memory. Each
+// entry's compressed and uncompressed sizes are both len(body).
+func buildZipEntries(entries ...testEntry) []byte {
 	var buf bytes.Buffer
 
-	// Local file header.
-	var lh []byte
-	lh = binary.LittleEndian.AppendUint32(lh, localFileHeaderSig)
-	lh = binary.LittleEndian.AppendUint16(lh, 20) // version needed
-	lh = binary.LittleEndian.AppendUint16(lh, 0)  // flags
-	lh = binary.LittleEndian.AppendUint16(lh, method)
-	lh = binary.LittleEndian.AppendUint16(lh, 0)    // time
-	lh = binary.LittleEndian.AppendUint16(lh, 0x21) // date: 1980-01-01
-	lh = binary.LittleEndian.AppendUint32(lh, crc)  // crc
-	lh = binary.LittleEndian.AppendUint32(lh, uint32(len(body)))
-	lh = binary.LittleEndian.AppendUint32(lh, uint32(len(body)))
-	lh = binary.LittleEndian.AppendUint16(lh, uint16(len(name)))
-	lh = binary.LittleEndian.AppendUint16(lh, 0) // extra len
-	buf.Write(lh)
-	buf.WriteString(name)
-	dataStart := buf.Len()
-	buf.Write(body)
+	// Local-header offsets of each entry, for the central directory.
+	lhOffsets := make([]int64, len(entries))
+	for i, e := range entries {
+		// Local file header.
+		var lh []byte
+		lh = binary.LittleEndian.AppendUint32(lh, localFileHeaderSig)
+		lh = binary.LittleEndian.AppendUint16(lh, 20) // version needed
+		lh = binary.LittleEndian.AppendUint16(lh, e.flags)
+		lh = binary.LittleEndian.AppendUint16(lh, e.method)
+		lh = binary.LittleEndian.AppendUint16(lh, 0)    // time
+		lh = binary.LittleEndian.AppendUint16(lh, 0x21) // date: 1980-01-01
+		lh = binary.LittleEndian.AppendUint32(lh, e.crc)
+		lh = binary.LittleEndian.AppendUint32(lh, uint32(len(e.body)))
+		lh = binary.LittleEndian.AppendUint32(lh, uint32(len(e.body)))
+		lh = binary.LittleEndian.AppendUint16(lh, uint16(len(e.name)))
+		lh = binary.LittleEndian.AppendUint16(lh, 0) // extra len
+		buf.Write(lh)
+		buf.WriteString(e.name)
+		lhOffsets[i] = int64(buf.Len()) - 30 - int64(len(e.name))
+		buf.Write(e.body)
+	}
 
 	// Central directory.
-	var cd []byte
-	cd = binary.LittleEndian.AppendUint32(cd, centralDirHeaderSig)
-	cd = binary.LittleEndian.AppendUint16(cd, 20)
-	cd = binary.LittleEndian.AppendUint16(cd, 20)
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint16(cd, method)
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint16(cd, 0x21)
-	cd = binary.LittleEndian.AppendUint32(cd, crc)
-	cd = binary.LittleEndian.AppendUint32(cd, uint32(len(body)))
-	cd = binary.LittleEndian.AppendUint32(cd, uint32(len(body)))
-	cd = binary.LittleEndian.AppendUint16(cd, uint16(len(name)))
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint16(cd, 0)
-	cd = binary.LittleEndian.AppendUint32(cd, 0) // external attributes
-	cd = binary.LittleEndian.AppendUint32(cd, 0) // local header offset
-	cd = append(cd, name...)
-	buf.Write(cd)
+	cdStart := buf.Len()
+	for i, e := range entries {
+		var cd []byte
+		cd = binary.LittleEndian.AppendUint32(cd, centralDirHeaderSig)
+		cd = binary.LittleEndian.AppendUint16(cd, 20)
+		cd = binary.LittleEndian.AppendUint16(cd, 20)
+		cd = binary.LittleEndian.AppendUint16(cd, e.flags)
+		cd = binary.LittleEndian.AppendUint16(cd, e.method)
+		cd = binary.LittleEndian.AppendUint16(cd, 0)
+		cd = binary.LittleEndian.AppendUint16(cd, 0x21)
+		cd = binary.LittleEndian.AppendUint32(cd, e.crc)
+		cd = binary.LittleEndian.AppendUint32(cd, uint32(len(e.body)))
+		cd = binary.LittleEndian.AppendUint32(cd, uint32(len(e.body)))
+		cd = binary.LittleEndian.AppendUint16(cd, uint16(len(e.name)))
+		cd = binary.LittleEndian.AppendUint16(cd, 0) // extra len
+		cd = binary.LittleEndian.AppendUint16(cd, 0) // comment len
+		cd = binary.LittleEndian.AppendUint16(cd, 0) // disk number start
+		cd = binary.LittleEndian.AppendUint16(cd, 0) // internal attributes
+		cd = binary.LittleEndian.AppendUint32(cd, 0) // external attributes
+		cd = binary.LittleEndian.AppendUint32(cd, uint32(lhOffsets[i]))
+		cd = append(cd, e.name...)
+		buf.Write(cd)
+	}
+	cd := buf.Bytes()[cdStart:]
 
 	// End of central directory.
 	var eocd []byte
 	eocd = binary.LittleEndian.AppendUint32(eocd, endOfCentralDirSig)
 	eocd = binary.LittleEndian.AppendUint16(eocd, 0)
 	eocd = binary.LittleEndian.AppendUint16(eocd, 0)
-	eocd = binary.LittleEndian.AppendUint16(eocd, 1)
-	eocd = binary.LittleEndian.AppendUint16(eocd, 1)
+	eocd = binary.LittleEndian.AppendUint16(eocd, uint16(len(entries)))
+	eocd = binary.LittleEndian.AppendUint16(eocd, uint16(len(entries)))
 	eocd = binary.LittleEndian.AppendUint32(eocd, uint32(len(cd)))
-	eocd = binary.LittleEndian.AppendUint32(eocd, uint32(dataStart+len(body)))
+	eocd = binary.LittleEndian.AppendUint32(eocd, uint32(cdStart))
 	eocd = binary.LittleEndian.AppendUint16(eocd, 0)
 	buf.Write(eocd)
 
@@ -259,6 +297,149 @@ func TestPPMdOldVariantRejected(t *testing.T) {
 	_, err = r.File[0].Open()
 	if !errors.Is(err, ErrInvalidPPMdProps) {
 		t.Fatalf("expected ErrInvalidPPMdProps, got %v", err)
+	}
+}
+
+func TestFreezeRestoreRejected(t *testing.T) {
+	// restore method 2 (freeze) is valid Ppmd8, but requires
+	// PPMD8_FREEZE_SUPPORT which neither 7-Zip default builds nor this
+	// package enable. It must fail with a dedicated, errors.Is-friendly
+	// error rather than decoding garbage or panicking.
+	archive := buildPPMdZip(ppmdProps(16, 6, 2), []byte{0, 0, 0, 0}, 0)
+	r, err := NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.File[0].Open()
+	if !errors.Is(err, ErrUnsupportedRestore) {
+		t.Fatalf("expected ErrUnsupportedRestore, got %v", err)
+	}
+}
+
+func TestEncryptedEntryRejected(t *testing.T) {
+	// The Reader must reject encrypted entries with ErrEncrypted (the
+	// StreamReader already did); otherwise the raw ciphertext would be
+	// silently decoded as garbage.
+	payload := []byte("ciphertext-not-really")
+	archive := buildZipEntries(testEntry{
+		name: "secret.txt", method: MethodStore, flags: encryptedFlag,
+		body: payload, crc: crc32.ChecksumIEEE(payload),
+	})
+	r, err := NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.File) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(r.File))
+	}
+	_, err = r.File[0].Open()
+	if !errors.Is(err, ErrEncrypted) {
+		t.Fatalf("expected ErrEncrypted, got %v", err)
+	}
+}
+
+func TestMaxModelMemory(t *testing.T) {
+	// A PPMd entry declares its model memory (1..256 MiB) in its 2-byte
+	// property block. Without a limit an attacker controls the allocation
+	// size per opened entry; WithMaxModelMemory rejects oversized entries
+	// before the arena is allocated.
+	tail := []byte{0, 0, 0, 0} // range coder init bytes (code = 0)
+
+	// memMB=1 passes with a 2 MiB limit...
+	small := buildPPMdZip(ppmdProps(1, 6, 0), tail, 0)
+	r, err := NewReader(bytes.NewReader(small), int64(len(small)), WithMaxModelMemory(2<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := r.File[0].Open()
+	if err != nil {
+		t.Fatalf("1 MiB model under a 2 MiB limit must open, got %v", err)
+	}
+	rc.Close()
+
+	// ...but fails with a 512 KiB limit.
+	r, err = NewReader(bytes.NewReader(small), int64(len(small)), WithMaxModelMemory(512<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.File[0].Open()
+	if !errors.Is(err, ErrModelMemoryLimit) {
+		t.Fatalf("expected ErrModelMemoryLimit, got %v", err)
+	}
+
+	// memMB=256 is rejected under a 16 MiB limit without allocating
+	// 256 MiB.
+	big := buildPPMdZip(ppmdProps(256, 6, 0), tail, 0)
+	r, err = NewReader(bytes.NewReader(big), int64(len(big)), WithMaxModelMemory(16<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.File[0].Open()
+	if !errors.Is(err, ErrModelMemoryLimit) {
+		t.Fatalf("expected ErrModelMemoryLimit, got %v", err)
+	}
+
+	// The limit applies to the streaming reader too.
+	sr := NewStreamReader(bytes.NewReader(small), WithMaxModelMemory(512<<10))
+	if _, err := sr.Next(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = sr.Open()
+	if !errors.Is(err, ErrModelMemoryLimit) {
+		t.Fatalf("stream: expected ErrModelMemoryLimit, got %v", err)
+	}
+
+	// Non-positive limit means unlimited (backwards compatible).
+	r, err = NewReader(bytes.NewReader(small), int64(len(small)), WithMaxModelMemory(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err = r.File[0].Open()
+	if err != nil {
+		t.Fatalf("zero limit must mean unlimited, got %v", err)
+	}
+	rc.Close()
+}
+
+func TestMaxModelMemoryConcurrent(t *testing.T) {
+	// Many entries opened at once, each requesting 16 MiB of model memory
+	// with an 8 MiB limit: every Open must fail fast with
+	// ErrModelMemoryLimit regardless of concurrency, so total memory stays
+	// bounded by the limit rather than limit*goroutines.
+	const n = 32
+	entries := make([]testEntry, n)
+	for i := range entries {
+		body := append(ppmdProps(16, 6, 0), 0, 0, 0, 0)
+		entries[i] = testEntry{
+			name: fmt.Sprintf("f%02d.bin", i), method: MethodPPMd, body: body,
+		}
+	}
+	archive := buildZipEntries(entries...)
+	r, err := NewReader(bytes.NewReader(archive), int64(len(archive)), WithMaxModelMemory(8<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.File) != n {
+		t.Fatalf("expected %d entries, got %d", n, len(r.File))
+	}
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, f := range r.File {
+		wg.Add(1)
+		go func(i int, f *File) {
+			defer wg.Done()
+			rc, err := f.Open()
+			if rc != nil {
+				rc.Close()
+			}
+			errs[i] = err
+		}(i, f)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if !errors.Is(err, ErrModelMemoryLimit) {
+			t.Errorf("entry %d: expected ErrModelMemoryLimit, got %v", i, err)
+		}
 	}
 }
 

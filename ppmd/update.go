@@ -27,19 +27,36 @@ func copyState(b []byte, dst, src uint32) {
 }
 
 // binSummIndex computes the flat index into p.binSumm (Ppmd8_GetBinSumm).
-func (p *Model) binSummIndex() uint32 {
+// The second return value is false when the model state is corrupt (an
+// out-of-arena pointer or an out-of-range index); the C original reads
+// out of bounds in that case.
+func (p *Model) binSummIndex() (uint32, bool) {
 	b := p.base
 	mc := p.minContext
+	if !p.inArena(mc, 4) {
+		return 0, false
+	}
 	oneStateFreq := uint32(b[mc+3]) // ONE_STATE(mc)->Freq
-	suffixNumStats := uint32(b[ctxSuffix(b, mc)])
+	if oneStateFreq == 0 {
+		return 0, false
+	}
+	suf := ctxSuffix(b, mc)
+	if !p.inArena(suf, 1) {
+		return 0, false
+	}
+	suffixNumStats := uint32(b[suf])
 	var runLenBit uint32
 	if p.runLength>>26&0x20 != 0 {
 		runLenBit = 0x20
 	}
-	return uint32(p.ns2indx[oneStateFreq-1])*64 +
+	idx := uint32(p.ns2indx[oneStateFreq-1])*64 +
 		p.prevSuccess + runLenBit +
 		uint32(p.ns2bsIndx[suffixNumStats]) +
 		uint32(b[mc+1]) // Flags
+	if idx >= uint32(len(p.binSumm)) {
+		return 0, false
+	}
+	return idx, true
 }
 
 // getUsedMemory is GetUsedMemory.
@@ -231,8 +248,36 @@ func (p *Model) restoreModel(ctxError uint32) {
 	p.minContext = p.maxContext
 }
 
+// inArena reports whether the byte range [o, o+n) lies inside the arena.
+func (p *Model) inArena(o, n uint32) bool {
+	l := uint32(len(p.base))
+	return o <= l && n <= l-o
+}
+
+// findState scans the state list of the context c for the symbol sym.
+// The scan is unbounded in the C original (a valid stream guarantees the
+// symbol is present); on corrupt input it can run past the arena, so it is
+// bounded by the context's declared state count. Returns 0 if not found.
+// (uint32 conversions matter: byte(255)+1 wraps to 0.)
+func (p *Model) findState(c uint32, sym byte) uint32 {
+	b := p.base
+	s := ctxStats(b, c)
+	n := (uint32(b[c]) + 1) * 6 // NumStats+1 states, 6 bytes each
+	if !p.inArena(s, n) {
+		return 0
+	}
+	end := s + n
+	for s < end && b[s] != sym {
+		s += 6
+	}
+	if s >= end {
+		return 0
+	}
+	return s
+}
+
 // createSuccessors is Ppmd8_CreateSuccessors. Returns 0 on allocation
-// failure.
+// failure or corrupt state.
 func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 	b := p.base
 	upBranch := stSuccessor(b, p.foundState)
@@ -247,14 +292,21 @@ func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 	for ctxSuffix(b, c) != 0 {
 		var s uint32
 		c = ctxSuffix(b, c)
+		if !p.inArena(c, unitSize) {
+			return 0
+		}
+		if numPs >= len(ps) {
+			// Corrupt suffix chain: valid models stay within maxOrder.
+			return 0
+		}
 		if s1 != 0 {
 			s = s1
 			s1 = 0
 		} else if b[c] != 0 { // NumStats != 0
 			sym := b[p.foundState]
-			s = ctxStats(b, c)
-			for b[s] != sym {
-				s += 6
+			s = p.findState(c, sym)
+			if s == 0 {
+				return 0
 			}
 			if b[s+1] < maxFreq-9 {
 				b[s+1]++
@@ -262,7 +314,11 @@ func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 			}
 		} else {
 			temp := uint32(0)
-			if b[ctxSuffix(b, c)] == 0 {
+			suf := ctxSuffix(b, c)
+			if !p.inArena(suf, 1) {
+				return 0
+			}
+			if b[suf] == 0 {
 				temp = 1
 			}
 			s = c + 2 // ONE_STATE(c)
@@ -273,6 +329,9 @@ func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 		successor := stSuccessor(b, s)
 		if successor != upBranch {
 			c = successor
+			if !p.inArena(c, unitSize) {
+				return 0
+			}
 			if numPs == 0 {
 				return c
 			}
@@ -282,6 +341,9 @@ func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 		numPs++
 	}
 
+	if !p.inArena(upBranch, 1) || !p.inArena(c, unitSize) {
+		return 0
+	}
 	newSym := b[upBranch]
 	upBranch++
 	flags := hiBitsFlag4(b[p.foundState]) + hiBitsFlag3(newSym)
@@ -290,12 +352,17 @@ func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 	if b[c] == 0 {
 		newFreq = b[c+3] // State2.Freq
 	} else {
-		s := ctxStats(b, c)
-		for b[s] != newSym {
-			s += 6
+		s := p.findState(c, newSym)
+		if s == 0 {
+			return 0
 		}
 		cf := uint32(b[s+1]) - 1
 		s0 := uint32(ctxSummFreq(b, c)) - uint32(b[c]) - cf
+		if s0 == 0 {
+			// Corrupt state guard (division below); unreachable on valid
+			// streams.
+			return 0
+		}
 		// max(newFreq) = (s->Freq - 1), when (s0 == 1)
 		if 2*cf <= s0 {
 			var v uint32
@@ -308,6 +375,11 @@ func (p *Model) createSuccessors(skip bool, s1 uint32, c uint32) uint32 {
 		}
 	}
 
+	if numPs <= 0 {
+		// Only reachable on corrupt state (C's do-while would underflow
+		// the counter and write out of bounds).
+		return 0
+	}
 	for {
 		// AllocContext(p)
 		var c1 uint32
@@ -365,15 +437,13 @@ func (p *Model) reduceOrder(s1 uint32, c uint32) uint32 {
 				return c
 			}
 			c = ctxSuffix(b, c)
+			if !p.inArena(c, unitSize) {
+				return 0
+			}
 			if b[c] != 0 { // NumStats
-				s = ctxStats(b, c)
-				if b[s] != b[p.foundState] {
-					for {
-						s += 6
-						if b[s] == b[p.foundState] {
-							break
-						}
-					}
+				s = p.findState(c, b[p.foundState])
+				if s == 0 {
+					return 0
 				}
 				if b[s+1] < maxFreq-9 {
 					b[s+1] += 2
@@ -427,6 +497,9 @@ func (p *Model) updateModel() {
 	if b[p.foundState+1] < maxFreq/4 && ctxSuffix(b, p.minContext) != 0 {
 		// Update freqs in the suffix context.
 		c = ctxSuffix(b, p.minContext)
+		if !p.inArena(c, unitSize) {
+			return
+		}
 		if b[c] == 0 {
 			s = c + 2
 			if b[s+1] < 32 {
@@ -434,18 +507,16 @@ func (p *Model) updateModel() {
 			}
 		} else {
 			sym := b[p.foundState]
-			s = ctxStats(b, c)
-			if b[s] != sym {
-				for {
-					s += 6
-					if b[s] == sym {
-						break
-					}
-				}
-				if b[s+1] >= b[s-5] {
-					swapStates(b, s, s-6)
-					s -= 6
-				}
+			stats := ctxStats(b, c)
+			s = p.findState(c, sym)
+			if s == 0 {
+				return
+			}
+			// Sort by freq: swap towards the front while the predecessor
+			// has an equal or higher freq (matches the C scan-then-swap).
+			if s != stats && b[s+1] >= b[s-5] {
+				swapStates(b, s, s-6)
+				s -= 6
 			}
 			if b[s+1] < maxFreq-9 {
 				b[s+1] += 2

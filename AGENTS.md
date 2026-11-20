@@ -12,12 +12,14 @@ text files. Test corpora live in `test_arch/` (gitignored, not committed).
 ## Layout
 
 - `zipppmd.go` — package doc, `FileHeader`, `File`, `Open`, CRC-32 checking
-  reader, `openBody` (method dispatch: store/deflate/ppmd).
+  reader, `openBody` (method dispatch: store/deflate/ppmd), exported
+  errors, `WithMaxModelMemory` option types.
 - `reader.go` — `Reader` (io.ReaderAt): EOCD (+ZIP64) scan, central
   directory parsing.
 - `stream.go` — `StreamReader` (io.Reader): sequential local-header walk.
 - `writer.go` — stub; PPMd compression not implemented (returns
   `ErrNotImplemented`).
+- `version.go` — `const Version` (semver without "v"; git tag is "v"+Version).
 - `ppmd/` — self-contained PPMd var.I (Ppmd8) decoder, a Go port of
   `C/Ppmd8.c` + `C/Ppmd8Dec.c` from the 7-Zip sources. Only decompression.
 - `cmd/zipppmd/` — CLI (`list`, `extract`; `create` is a stub).
@@ -49,12 +51,55 @@ text files. Test corpora live in `test_arch/` (gitignored, not committed).
     `setNodeNext(b, node, v)` (+4 inside). Don't add +4 again.
   - `RESTORE_MODEL(c1, x)` ignores the second argument: the error context
     is always the first one.
+  - **Go byte arithmetic wraps**: `b[c]+1` on a `byte(255)` yields `0`.
+    Always widen first: `(uint32(b[c]) + 1)`. (This broke valid decoding
+    once when added to the state-list scan bound.)
 - `makeEscFreq` indexes `see[row*32 + col]`; don't forget the row stride.
 - Streaming (`StreamReader`) positions the shared stream after each entry
   by: drain `openRC`, drain the raw decompressor (ppmd/flate read ahead),
   then `Discard(csize - counted)`.
 - CRC-32 (IEEE) is verified per entry; `checksumReader` errors with
   `ErrChecksum`.
+
+## Robustness / resource limits 
+
+- `WithMaxModelMemory(n)` (`NewReader`/`NewStreamReader` option) caps the
+  PPMd model memory one entry may request (props allow 1..256 MiB); entries
+  over the limit fail with `ErrModelMemoryLimit` **before** the arena is
+  allocated — important for servers that open entries concurrently.
+- Error taxonomy (all `errors.Is`-friendly): `ErrInvalidPPMdProps` (restore
+  > 2, same check as 7-Zip), `ErrUnsupportedRestore` (restore == 2,
+  freeze — valid Ppmd8 but unsupported, like 7-Zip default builds),
+  `ErrEncrypted` (checked in both Reader and StreamReader), `ErrCorrupt`,
+  `ErrChecksum`, `ppmd.ErrCorrupt`.
+- Decoder termination: when the compressed input is exhausted,
+  `decodeSymbol` returns corrupt-data (`io.ErrUnexpectedEOF` via
+  `Decoder.Read`), and `rcNorm` stops feeding phantom zero bytes (the
+  original port spun forever / emitted an endless phantom-symbol stream on
+  truncated input — found by fuzzing). `rcGetThreshold` maps a
+  denormalized zero range to the largest count so the corrupt-data path is
+  taken instead of dividing by zero. Note: a valid entry's stream decodes
+  to a few *extra* symbols past `UncompressedSize` (the encoder's
+  range-coder flush); the zip layer discards them via
+  `io.LimitReader(decoder, UncompressedSize)` in `openBody`, so the
+  exhaustion checks must stay behind that limit.
+- The state-list scans in `createSuccessors` are bounded by the context's
+  declared `NumStats+1` entries (`findState`) instead of running unbounded
+  like the C original — on corrupt input the C scan reads past the arena
+  (Go panics; found by fuzzing). The same bound applies in `updateModel`
+  and `reduceOrder`. The suffix chain walk is likewise bounded
+  (`ps` overflow, out-of-arena suffix/successor pointers in
+  `createSuccessors` and `decodeSymbol`, and `binSummIndex` validates its
+  pointers and result index, returning `(idx, false)` on corrupt state).
+  Only triggers on corrupt data; valid streams unaffected. Beware:
+  `b[ctxSuffix(b,c)] == 0` reads the *byte at* the suffix context (its
+  NumStats), it does NOT compare the pointer to zero — don't "simplify"
+  it.
+- Fuzz tests: `FuzzReader` (zip parsing + decoding) and `ppmd.FuzzDecoder`.
+  Run: `go test -fuzz=FuzzReader -fuzztime=60s .` and
+  `go test -fuzz=FuzzDecoder -fuzztime=60s ./ppmd/`. FuzzDecoder caps the
+  model at 1..4 MiB per input so the fuzzer stays fast. Crashers found by
+  fuzzing are kept as regression seeds in `ppmd/testdata/fuzz/FuzzDecoder/`.
 
 ## Ppmd7 (var.H) — out of scope, archives do not exist
 

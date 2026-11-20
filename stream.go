@@ -17,17 +17,23 @@ import (
 // again. If the previous entry was not fully read, Next drains the
 // remaining data automatically.
 type StreamReader struct {
-	r       *bufio.Reader
-	cur     *File
-	openRC  io.ReadCloser
-	raw     io.Reader // the decompressor, for draining
-	counted *countingReader
-	err     error
+	r           *bufio.Reader
+	cur         *File
+	openRC      io.ReadCloser
+	raw         io.Reader // the decompressor, for draining
+	counted     *countingReader
+	maxModelMem uint64 // PPMd model memory limit per entry, in bytes (0 = unlimited)
+	err         error
 }
 
-// NewStreamReader creates a StreamReader reading from r.
-func NewStreamReader(r io.Reader) *StreamReader {
-	return &StreamReader{r: bufio.NewReaderSize(r, 64*1024)}
+// NewStreamReader creates a StreamReader reading from r. It accepts the
+// same options as NewReader (see WithMaxModelMemory).
+func NewStreamReader(r io.Reader, opts ...ReaderOption) *StreamReader {
+	var cfg readerConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return &StreamReader{r: bufio.NewReaderSize(r, 64*1024), maxModelMem: cfg.maxModelMem}
 }
 
 // Next advances to the next entry in the archive, returning its header. The
@@ -142,7 +148,7 @@ func (s *StreamReader) Open() (io.ReadCloser, error) {
 		return nil, errors.New("zipppmd: entry already opened")
 	}
 	body := &countingReader{r: io.LimitReader(s.r, int64(s.cur.CompressedSize))}
-	rc, raw, counted, err := openBody(s.cur.FileHeader, body)
+	rc, raw, counted, err := openBody(s.cur.FileHeader, body, s.maxModelMem)
 	if err != nil {
 		s.err = err
 		return nil, err

@@ -8,9 +8,13 @@ const (
 	kBot = uint32(1) << 15
 )
 
-// rcNorm is the RC_NORM macro.
+// rcNorm is the RC_NORM macro. When the input is exhausted the loop exits
+// instead of spinning on phantom zero bytes fed by byteReader; the decoder
+// reports corrupt data on the next decodeSymbol call (see its br.failed
+// check), so the state may temporarily violate the range-coder invariants
+// here — rcGetThreshold tolerates a denormalized range for that reason.
 func (p *Model) rcNorm(br *byteReader) {
-	for {
+	for !br.failed {
 		if (p.low ^ (p.low + p.range_)) < kTop {
 			// fall through to normalization below
 		} else if p.range_ < kBot {
@@ -38,9 +42,15 @@ func (p *Model) rcDecodeFinal(br *byteReader, start, size uint32) {
 	p.rcNorm(br)
 }
 
-// rcGetThreshold is RC_GetThreshold.
+// rcGetThreshold is RC_GetThreshold. After rcNorm bailed out on exhausted
+// input the range may be denormalized down to zero; a zero range would
+// panic on division, so return the largest possible count, which drives
+// every caller down its "count >= total" corrupt-data path.
 func (p *Model) rcGetThreshold(total uint32) uint32 {
 	p.range_ /= total
+	if p.range_ == 0 {
+		return ^uint32(0)
+	}
 	return p.code / p.range_
 }
 
@@ -78,11 +88,19 @@ func setAllBits(mask *[256]byte) {
 // decodeSymbol is Ppmd8_DecodeSymbol. It returns a symbol [0, 255], or
 // SymEnd (-1) at the end-of-payload marker, or -2 on corrupt data.
 func (p *Model) decodeSymbol(br *byteReader) int {
+	if br.failed {
+		// The compressed input is exhausted; refuse to decode an endless
+		// stream of phantom zero-byte symbols.
+		return -2
+	}
 	b := p.base
 	var charMask [256]byte
 
 	if b[p.minContext] != 0 { // NumStats != 0
 		stats := ctxStats(b, p.minContext)
+		if !p.inArena(stats, (uint32(b[p.minContext])+1)*6) {
+			return -2
+		}
 		summFreq := uint32(ctxSummFreq(b, p.minContext))
 		if summFreq > p.range_ { // PPMD8_CORRECT_SUM_RANGE
 			summFreq = p.range_
@@ -141,7 +159,10 @@ func (p *Model) decodeSymbol(br *byteReader) int {
 		}
 	} else {
 		s := p.minContext + 2 // ONE_STATE
-		probIdx := p.binSummIndex()
+		probIdx, ok := p.binSummIndex()
+		if !ok {
+			return -2
+		}
 		pr := uint32(p.binSumm[probIdx])
 		size0 := (p.range_ >> 14) * pr
 		pr = updateProb1(pr)
@@ -161,6 +182,9 @@ func (p *Model) decodeSymbol(br *byteReader) int {
 				b[s+1] = byte(freq + 1)
 			}
 			if p.orderFall == 0 && c >= p.unitsStart {
+				if !p.inArena(c, unitSize) {
+					return -2
+				}
 				p.maxContext = c
 				p.minContext = c
 			} else {
@@ -197,6 +221,9 @@ func (p *Model) decodeSymbol(br *byteReader) int {
 				return -1 // PPMD8_SYM_END
 			}
 			mc = suf
+			if !p.inArena(mc, unitSize) {
+				return -2
+			}
 			if uint32(b[mc]) != numMasked {
 				break
 			}
@@ -204,6 +231,9 @@ func (p *Model) decodeSymbol(br *byteReader) int {
 
 		s := ctxStats(b, mc)
 		num := uint32(b[mc]) + 1
+		if !p.inArena(s, num*6) {
+			return -2
+		}
 		num2 := num / 2
 		num &= 1
 		var hiCnt uint32
